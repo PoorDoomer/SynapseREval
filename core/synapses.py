@@ -23,7 +23,7 @@ from collections import deque
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
-from llm import UltimateReVALAgent
+from core.llm import UltimateReVALAgent
 import networkx as nx
 import numpy as np
 
@@ -137,7 +137,25 @@ class Neuron:
         self.inbox.clear()
 
         try:
-            response: str = await self.agent.chat("\n".join(prompt_parts), net_history)
+            # Add a small delay before each LLM call to prevent rate limiting
+            await asyncio.sleep(1.0)
+            
+            # Translate the network's history format to the agent's expected format.
+            # The network history contains outputs from previous agents (neurons).
+            # We map the 'payload' of these outputs to the 'assistant' role's 'content'.
+            formatted_history = [
+                {
+                    "role": "assistant", 
+                    "content": entry.get("payload", "")
+                }
+                for entry in net_history
+            ]
+            
+            # Call the agent with the correctly formatted history
+            response: str = await self.agent.chat(
+                "\n".join(prompt_parts),
+                history=formatted_history
+            )
         except Exception as ex:  # noqa: BLE001
             log.error("LLM error in %s: %s", self.role, ex)
             return None
@@ -166,6 +184,21 @@ class SynapseNetwork:
         self.neurons[name] = neuron
         log.info("Neuron added: %s (%s)", name, neuron.role)
 
+    async def add_neurons_staggered(self, neurons_config: List[Tuple[str, str, float]], agent_factory, delay: float = 2.0):
+        """Add multiple neurons with a delay between each initialization to prevent API rate limiting.
+        
+        Args:
+            neurons_config: List of (name, role, threshold) tuples
+            agent_factory: Function to create agent instances
+            delay: Seconds to wait between neuron initializations
+        """
+        for name, role, threshold in neurons_config:
+            agent = agent_factory(name, role)
+            neuron = Neuron(agent, threshold=threshold, role=role)
+            self.add_neuron(name, neuron)
+            log.info("Staggered neuron added: %s (%s) - waiting %s seconds", name, role, delay)
+            await asyncio.sleep(delay)
+
     def connect(self, src: str, dst: str, *, weight: float = 1.0, plastic: bool = True):
         self.G.add_edge(src, dst, syn=Synapse(src, dst, weight, plastic))
         log.info("Synapse created: %s → %s  w=%.2f", src, dst, weight)
@@ -193,7 +226,8 @@ class SynapseNetwork:
             ],
             "history": self.history,
         }
-        path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+        # Use explicit UTF-8 encoding to handle special characters
+        path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
         log.info("Network state saved → %s", path)
 
     @classmethod
@@ -227,6 +261,7 @@ class SynapseNetwork:
         max_cycles: int = 6,
         entry_neuron: str | None = None,
         initial_prompt: str | None = None,
+        neuron_delay: float = 1.0,  # Add delay parameter with default of 1 second
     ):
         """
         Execute the network for at most `max_cycles` synchronous steps.
@@ -265,6 +300,8 @@ class SynapseNetwork:
                     node,
                     str(sp_out.payload).replace("\n", " "),
                 )
+                # Add delay between neuron processing to avoid rate limiting
+                await asyncio.sleep(neuron_delay)
 
             if not fired:
                 log.info("Stable state reached – no spikes fired.")
@@ -357,10 +394,14 @@ if __name__ == "__main__":
             )
 
         net = SynapseNetwork(learning_rate=0.05)
-        # Core neurons
-        net.add_neuron("Planner", Neuron(agent_factory("Planner", "planner"), threshold=1.0, role="planner"))
-        net.add_neuron("Executor", Neuron(agent_factory("Executor", "executor"), threshold=1.0, role="executor"))
-        net.add_neuron("Finalizer", Neuron(agent_factory("Finalizer", "finalizer"), threshold=1.0, role="finalizer"))
+        
+        # Use staggered initialization to prevent API rate limiting
+        neurons_config = [
+            ("Planner", "planner", 1.0),
+            ("Executor", "executor", 1.0),
+            ("Finalizer", "finalizer", 1.0),
+        ]
+        await net.add_neurons_staggered(neurons_config, agent_factory, delay=3.0)
 
         # Synapses
         net.connect("Planner", "Executor", weight=1.2)
@@ -368,7 +409,7 @@ if __name__ == "__main__":
         net.connect("Finalizer", "Planner", weight=0.4)
 
         # Inject initial question
-        await net.run(max_cycles=8, entry_neuron="Planner", initial_prompt="Résume la météo à Casablanca pour aujourd'hui.")
+        await net.run(max_cycles=8, entry_neuron="Planner", initial_prompt="Résume la météo à Casablanca pour aujourd'hui.", neuron_delay=3.0)
 
         # Persist
         net.save("brain.json")

@@ -306,12 +306,23 @@ class UltimateReVALAgent:
         # re-inject it when the tool is executed.
         if inspect.ismethod(func):
             owning_instance = func.__self__
+            original_handler = spec.handler
 
-            async def _bound_handler(*args, _h=func.__tool_spec__.handler, **kwargs):
-                # Always pass the original `self` first
-                return await _h(owning_instance, *args, **kwargs)
+            # The key is that the new handler should NOT expect `owning_instance` as a separate argument.
+            # `original_handler` is already bound to the instance.
+            # We just need to ensure the call is awaited correctly.
+            async def bound_method_wrapper(*args, **kwargs):
+                # 'original_handler' is already the bound method, so it implicitly has `self`.
+                # We just call it with the provided args from the LLM.
+                return await original_handler(*args, **kwargs)
 
-            func.__tool_spec__.handler = _bound_handler      # 🔑
+            # We create a NEW ToolSpec to avoid modifying the original in-place
+            spec = ToolSpec(
+                name=spec.name,
+                description=spec.description,
+                args_schema=spec.args_schema,
+                handler=bound_method_wrapper
+            )      # 🔑
             
         spec: ToolSpec = func.__tool_spec__  # type: ignore[attr-defined]
         self._debug_step(f"Registering tool: {spec.name}")

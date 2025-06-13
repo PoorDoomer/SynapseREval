@@ -85,7 +85,8 @@ async def main():
     history = await net.run(
         max_cycles=6,
         entry_neuron="Researcher",
-        initial_prompt=question
+        initial_prompt=question,
+        neuron_delay=2.0
     )
     
     # Extract the final answer from the Writer

@@ -31,7 +31,7 @@ class ResearchAgent(UltimateReVALAgent):
     def __init__(self, name, model="gpt-4", debug=False):
         super().__init__(model=model, debug=debug)
         self.name = name
-        self.set_persona_prompt(
+        self.persona_prompt(
             f"You are {name}, a specialized research agent that excels at finding "
             f"relevant information on topics. You focus solely on gathering facts "
             f"and data without analysis. Be thorough but concise."
@@ -52,7 +52,7 @@ class AnalysisAgent(UltimateReVALAgent):
     def __init__(self, name, model="gpt-4", debug=False):
         super().__init__(model=model, debug=debug)
         self.name = name
-        self.set_persona_prompt(
+        self.persona_prompt(
             f"You are {name}, a specialized analysis agent that excels at analyzing "
             f"and synthesizing information. You identify patterns, draw connections, "
             f"and extract insights from raw data. Be analytical and precise."
@@ -64,7 +64,7 @@ class WritingAgent(UltimateReVALAgent):
     def __init__(self, name, model="gpt-4", debug=False):
         super().__init__(model=model, debug=debug)
         self.name = name
-        self.set_persona_prompt(
+        self.persona_prompt(
             f"You are {name}, a specialized writing agent that excels at creating "
             f"well-structured, engaging content. You transform ideas and analysis "
             f"into clear, coherent text optimized for the target audience."
@@ -76,7 +76,7 @@ class PlanningAgent(UltimateReVALAgent):
     def __init__(self, name, model="gpt-4", debug=False):
         super().__init__(model=model, debug=debug)
         self.name = name
-        self.set_persona_prompt(
+        self.persona_prompt(
             f"You are {name}, a specialized planning agent that excels at coordinating "
             f"complex workflows. You break down tasks, assign responsibilities, and "
             f"ensure the overall process runs smoothly. Be strategic and organized."
