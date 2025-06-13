@@ -84,8 +84,8 @@ The intelligent, resilient "neuron" that performs the actual work.
 
 1.  **Clone the repository:**
     ```bash
-    git clone https://github.com/your-username/SynapseReVAL.git
-    cd SynapseReVAL
+    git clone https://github.com/PoorDoomer/SynapseREval.git
+    cd SynapseREval
     ```
 
 2.  **Create a virtual environment (recommended):**
