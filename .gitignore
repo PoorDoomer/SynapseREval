@@ -1,0 +1,9 @@
+logs/
+__pycache__/
+.env.local
+.env
+.env.local
+.env
+.env.local
+.env
+brains/
