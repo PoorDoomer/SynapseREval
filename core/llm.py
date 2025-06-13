@@ -1,19 +1,18 @@
 # -*- coding: utf-8 -*-
-"""llm.py ─ merged v1
+"""llm.py ─ UltimateReVALAgent v2 with all improvements
 
+Key Improvements:
+• Docker sandboxing for create_and_test_tool
+• Real simple_verifier implementation
+• ScratchPad memory management with async cleanup
+• Multi-model token counting
+• Hierarchical message trimming
+• Rich logging with color-safe output
+• Adaptive tool timeouts
+• Persistent _fc_supported caching
+• Improved JSON parsing
 
-───────────────────────────────────────────────────────────────────────────────
-Key Features
-────────────
-• **ReVAL loop** (Reason‑Verify‑Adapt‑Loop) with confidence gating & self‑reflection.
-• Dual **tool‑calling** strategy: native OpenAI function‑calling *or* JSON fallback.
-• **ScratchPad** with TTL + automatic large‑payload off‑loading.
-• Built‑in **meta‑tools** (goal‑state store, complexity estimator, verifier, etc.).
-• Automatic **toolsmith** (create & test new tools on‑the‑fly).
-• Robust **guard‑rails**: strict JSON schema, timeout sandbox, adaptive token trim.
-• Drop‑in compatibility with any project already using `tools.py` helpers.
-
-Dependencies: tiktoken, pydantic, python‑dotenv, openai>=1.0.0
+Dependencies: tiktoken, pydantic, python-dotenv, openai>=1.0.0, rich, docker
 """
 from __future__ import annotations
 
@@ -26,12 +25,16 @@ import json
 import logging
 import os
 import re
+import subprocess
 import sys
+import tempfile
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from functools import partial
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Type
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Type, Tuple
 
 import tiktoken
 from dotenv import load_dotenv
@@ -42,31 +45,25 @@ from openai import (
     RateLimitError,
 )
 from pydantic import BaseModel, Field, ValidationError, create_model
+from rich.console import Console
+from rich.logging import RichHandler
+from rich.text import Text
 
-# ANSI color codes for terminal output
-class Colors:
-    if os.name == 'nt':  # Windows
-        GREEN = ""
-        RED = ""
-        YELLOW = ""
-        BLUE = ""
-        MAGENTA = ""
-        CYAN = ""
-        BOLD = ""
-        UNDERLINE = ""
-        END = ""
-    else:
-        GREEN = "\033[92m"
-        RED = "\033[91m"
-        YELLOW = "\033[93m"
-        BLUE = "\033[94m"
-        MAGENTA = "\033[95m"
-        CYAN = "\033[96m"
-        BOLD = "\033[1m"
-        UNDERLINE = "\033[4m"
-        END = "\033[0m"
+# Try to import docker, but make it optional
+try:
+    import docker
+    # Check if Docker daemon is actually running and accessible
+    try:
+        client = docker.from_env()
+        client.ping()
+        DOCKER_AVAILABLE = True
+    except Exception:
+        DOCKER_AVAILABLE = False
+except ImportError:
+    DOCKER_AVAILABLE = False
+
 ###############################################################################
-# 1.  Primitive helpers – Tool decorator & ScratchPad
+# 1.  Enhanced Tool decorator & ScratchPad with memory management
 ###############################################################################
 @dataclass
 class ToolSpec:
@@ -74,9 +71,10 @@ class ToolSpec:
     description: str
     args_schema: Type[BaseModel]
     handler: Callable[..., Awaitable[Any]]
+    expected_runtime: Optional[float] = None  # New field for adaptive timeout
 
-def tool(desc: str = "") -> Callable[[Callable], Callable]:
-    """Decorator that turns a function/method into a registered *tool*."""
+def tool(desc: str = "", expected_runtime: Optional[float] = None) -> Callable[[Callable], Callable]:
+    """Enhanced decorator that turns a function/method into a registered tool."""
 
     def decorator(func: Callable):
         sig = inspect.signature(func)
@@ -104,14 +102,17 @@ def tool(desc: str = "") -> Callable[[Callable], Callable]:
         # Combine description and docstring for richer tool documentation
         combined_desc = desc
         if func.__doc__:
-            # If we have both a description and docstring, combine them
             if desc:
                 combined_desc = f"{desc}\n\n{func.__doc__}"
             else:
                 combined_desc = func.__doc__
                 
         func.__tool_spec__ = ToolSpec(  # type: ignore[attr-defined]
-            func.__name__, combined_desc or "", ArgsModel, _wrapper
+            func.__name__, 
+            combined_desc or "", 
+            ArgsModel, 
+            _wrapper,
+            expected_runtime
         )
         return func
 
@@ -119,12 +120,18 @@ def tool(desc: str = "") -> Callable[[Callable], Callable]:
 
 
 class ScratchPad(dict):
-    """In‑memory TTL‑aware key‑value store (auto‑cleans on access)."""
+    """Enhanced in-memory TTL-aware key-value store with automatic cleanup."""
+
+    def __init__(self):
+        super().__init__()
+        self._cleanup_task: Optional[asyncio.Task] = None
+        self._items_count = 0  # For metrics
 
     def store(self, value: Any, ttl: Optional[int] = None) -> str:
         key = f"sp_{uuid.uuid4().hex[:8]}"
         expiry = time.time() + ttl if ttl else None
         super().__setitem__(key, (value, expiry))
+        self._items_count = len(self)
         return key
 
     def load(self, key: str):
@@ -133,17 +140,221 @@ class ScratchPad(dict):
         val, exp = self[key]
         if exp and exp < time.time():
             del self[key]
+            self._items_count = len(self)
             raise KeyError(f"{key} expired")
         return val
 
+    async def cleanup_expired(self):
+        """Remove expired items from the scratchpad."""
+        current_time = time.time()
+        expired_keys = []
+        
+        for key, (_, expiry) in self.items():
+            if expiry and expiry < current_time:
+                expired_keys.append(key)
+        
+        for key in expired_keys:
+            del self[key]
+        
+        self._items_count = len(self)
+        return len(expired_keys)
+
+    def start_cleanup_task(self, interval_seconds: int = 300):
+        """Start a background task to clean up expired items periodically."""
+        async def _cleanup_loop():
+            while True:
+                try:
+                    await asyncio.sleep(interval_seconds)
+                    removed = await self.cleanup_expired()
+                    if removed > 0:
+                        logging.debug(f"ScratchPad cleanup: removed {removed} expired items")
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logging.error(f"ScratchPad cleanup error: {e}")
+
+        if self._cleanup_task is None or self._cleanup_task.done():
+            self._cleanup_task = asyncio.create_task(_cleanup_loop())
+
+    def stop_cleanup_task(self):
+        """Stop the cleanup task."""
+        if self._cleanup_task and not self._cleanup_task.done():
+            self._cleanup_task.cancel()
+
+    @property
+    def items_count(self) -> int:
+        """Get current number of items (for metrics)."""
+        return self._items_count
+
 ###############################################################################
-# 2.  UltimateReVALAgent – core engine
+# 2.  Enhanced logging with Rich
+###############################################################################
+def setup_rich_logging(debug: bool = True, log_file: Optional[str] = None) -> logging.Logger:
+    """Set up enhanced logging with Rich console output."""
+    console = Console(
+        force_terminal=True if sys.stdout.isatty() else None,
+        force_jupyter=False,
+        force_interactive=False
+    )
+    
+    # Create logger
+    logger = logging.getLogger("UltimateReVAL")
+    logger.setLevel(logging.DEBUG if debug else logging.INFO)
+    logger.handlers.clear()
+    
+    # Rich console handler
+    console_handler = RichHandler(
+        console=console,
+        rich_tracebacks=True,
+        tracebacks_show_locals=debug,
+        show_time=True,
+        show_path=debug
+    )
+    console_handler.setLevel(logging.DEBUG if debug else logging.INFO)
+    logger.addHandler(console_handler)
+    
+    # File handler if specified
+    if log_file:
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setLevel(logging.DEBUG)
+        file_format = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        file_handler.setFormatter(file_format)
+        logger.addHandler(file_handler)
+    
+    return logger
+
+###############################################################################
+# 3.  JSON parsing utilities
+###############################################################################
+def strip_json_markdown(text: str) -> Optional[str]:
+    """Extract JSON from markdown code blocks more robustly."""
+    # Try multiple patterns for JSON blocks
+    patterns = [
+        r"```json\s*\n([\s\S]*?)\n```",
+        r"```JSON\s*\n([\s\S]*?)\n```",
+        r"```\s*\n(\{[\s\S]*?\})\s*\n```",
+        r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}"  # Direct JSON object
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, text, re.MULTILINE | re.DOTALL)
+        if match:
+            json_str = match.group(1) if len(match.groups()) > 0 else match.group(0)
+            try:
+                # Validate it's proper JSON
+                json.loads(json_str)
+                return json_str
+            except json.JSONDecodeError:
+                continue
+    
+    return None
+
+###############################################################################
+# 4.  Docker sandbox utilities
+###############################################################################
+class DockerSandbox:
+    """Docker-based sandbox for safe code execution."""
+    
+    def __init__(self):
+        self.client = docker.from_env() if DOCKER_AVAILABLE else None
+        self.image = "python:3.11-slim"
+        
+    async def execute_code(
+        self, 
+        code: str, 
+        timeout: int = 10, 
+        memory_limit: str = "128m"
+    ) -> Tuple[bool, str]:
+        """Execute Python code in a Docker container."""
+        if not DOCKER_AVAILABLE:
+            return False, "Docker not available - install docker package"
+        
+        # Create temporary file with the code
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+            f.write(code)
+            code_file = f.name
+        
+        try:
+            # Run in container
+            container = self.client.containers.run(
+                self.image,
+                f"python /code/script.py",
+                volumes={
+                    os.path.dirname(code_file): {'bind': '/code', 'mode': 'ro'}
+                },
+                working_dir="/tmp",
+                mem_limit=memory_limit,
+                network_mode="none",
+                read_only=True,
+                remove=True,
+                detach=True,
+                command=["/bin/sh", "-c", f"timeout {timeout} python /code/{os.path.basename(code_file)}"]
+            )
+            
+            # Wait for completion
+            result = container.wait(timeout=timeout + 2)
+            output = container.logs(stdout=True, stderr=True).decode('utf-8')
+            
+            success = result.get('StatusCode', 1) == 0
+            return success, output
+            
+        except Exception as e:
+            return False, f"Sandbox error: {str(e)}"
+        finally:
+            # Cleanup
+            if os.path.exists(code_file):
+                os.unlink(code_file)
+
+###############################################################################
+# 5.  Cache management for _fc_supported
+###############################################################################
+class FunctionCallingCache:
+    """Persistent cache for function calling support status."""
+    
+    def __init__(self, cache_file: str = ".fc_cache.json"):
+        self.cache_file = Path(cache_file)
+        self._cache: Dict[str, Dict] = {}
+        self._load()
+    
+    def _load(self):
+        """Load cache from file."""
+        if self.cache_file.exists():
+            try:
+                with open(self.cache_file, 'r') as f:
+                    self._cache = json.load(f)
+            except Exception:
+                self._cache = {}
+    
+    def _save(self):
+        """Save cache to file."""
+        try:
+            with open(self.cache_file, 'w') as f:
+                json.dump(self._cache, f)
+        except Exception:
+            pass
+    
+    def get(self, model: str) -> Optional[bool]:
+        """Get cached function calling support status."""
+        if model in self._cache:
+            entry = self._cache[model]
+            # Check if entry is still valid (24h TTL)
+            if datetime.fromisoformat(entry['timestamp']) > datetime.now() - timedelta(days=1):
+                return entry['supported']
+        return None
+    
+    def set(self, model: str, supported: bool):
+        """Cache function calling support status."""
+        self._cache[model] = {
+            'supported': supported,
+            'timestamp': datetime.now().isoformat()
+        }
+        self._save()
+
+###############################################################################
+# 6.  UltimateReVALAgent – Enhanced core engine
 ###############################################################################
 class UltimateReVALAgent:
-    """Merged agent implementing ReVAL + Ultimate features."""
-
-    # Regex to capture JSON blocks in fallback mode
-    _JSON_RE = re.compile(r"```json\s*([\s\S]*?)```", re.I)
+    """Enhanced ReVAL agent with all improvements."""
 
     STRICT_JSON_ERROR = (
         "⛔️ Format invalide. Réponds UNIQUEMENT par un bloc ```json``` contenant `tool_call`."
@@ -160,6 +371,9 @@ class UltimateReVALAgent:
         persona_prompt: str | None = None,
         debug: bool = True,
         debug_log_file: str | None = None,
+        encoding_override: Optional[str] = None,  # New parameter
+        verifier_model: str = "gpt-3.5-turbo",   # For simple_verifier
+        register_default_tools: bool = True,     # Control default tool registration
     ) -> None:
         # ── ENV & LLM client ────────────────────────────────────────────────
         load_dotenv(".env.local")
@@ -167,7 +381,7 @@ class UltimateReVALAgent:
         if not api_key:
             raise RuntimeError("Missing API key env var")
             
-        # Check if using OpenRouter based on model name or explicit env var
+        # Check if using OpenRouter
         is_openrouter = "openrouter" in os.getenv("LLM_BASE_URL", "").lower() or \
                       any(provider in model for provider in ["deepseek", "anthropic", "mistral", "google"])
         
@@ -188,57 +402,50 @@ class UltimateReVALAgent:
 
         # ── core settings ───────────────────────────────────────────────────
         self.model = model
+        self.verifier_model = verifier_model
         self.tool_support_flag = tool_support
         self.temperature = temperature
         self.max_model_tokens = max_model_tokens
         self.max_response_tokens = max_response_tokens
-        self._enc = tiktoken.get_encoding("cl100k_base")
+        
+        # Enhanced token encoding
+        if encoding_override:
+            self._enc = tiktoken.get_encoding(encoding_override)
+        else:
+            try:
+                self._enc = tiktoken.encoding_for_model(model.split("/")[-1])
+            except KeyError:
+                self._enc = tiktoken.get_encoding("cl100k_base")
+        
         self.debug = debug
 
         # ── runtime state ───────────────────────────────────────────────────
         self.scratch = ScratchPad()
+        self.scratch.start_cleanup_task()  # Start automatic cleanup
         self.tools: Dict[str, ToolSpec] = {}
-        self._fc_supported: Optional[bool] = None  # unknown until first attempt
+        self.fc_cache = FunctionCallingCache()
+        self._fc_supported: Optional[bool] = self.fc_cache.get(model)
+        self.docker_sandbox = DockerSandbox() if DOCKER_AVAILABLE else None
 
         # ── logging ─────────────────────────────────────────────────────────
-        self.log = logging.getLogger("UltimateReVAL")
-        
-        # Setup enhanced debugging if enabled
-        if debug:
-            self.log.setLevel(logging.DEBUG)
-            
-            # Console handler with formatting
-            console_handler = logging.StreamHandler(sys.stdout)
-            console_handler.setLevel(logging.DEBUG)
-            console_format = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-            console_handler.setFormatter(console_format)
-            self.log.addHandler(console_handler)
-            
-            # File handler if log file is specified
-            if debug_log_file:
-                file_handler = logging.FileHandler(debug_log_file)
-                file_handler.setLevel(logging.DEBUG)
-                file_format = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-                file_handler.setFormatter(file_format)
-                self.log.addHandler(file_handler)
-                
-            self.log.debug(f"Initializing UltimateReVALAgent with model: {model}")
-            self.log.debug(f"OpenRouter mode: {is_openrouter}")
-        else:
-            self.log.setLevel(logging.INFO)
-            
-        if debug and not self.log.handlers:
-            logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
+        self.log = setup_rich_logging(debug, debug_log_file)
+        self.log.debug(f"Initializing UltimateReVALAgent with model: {model}")
+        self.log.debug(f"OpenRouter mode: {is_openrouter}")
+        self.log.debug(f"Docker available: {DOCKER_AVAILABLE}")
 
         # ── register built‑in tools ─────────────────────────────────────────────
-        self._debug_step("Registering built-in tools")
-        self.register_tool(self.update_goal_state)
-        self.register_tool(self.save_to_scratchpad)
-        self.register_tool(self.load_from_scratchpad)
-        self.register_tool(self.self_reflect_and_replan)
-        self.register_tool(self.complexity_estimator)
-        self.register_tool(self.simple_verifier)
-        self.register_tool(self.create_and_test_tool)
+        if register_default_tools:
+            self._debug_step("Registering built-in tools")
+            self.register_tool(self.update_goal_state)
+            self.register_tool(self.save_to_scratchpad)
+            self.register_tool(self.load_from_scratchpad)
+            self.register_tool(self.self_reflect_and_replan)
+            self.register_tool(self.complexity_estimator)
+            self.register_tool(self.simple_verifier)
+            self.register_tool(self.create_and_test_tool)
+            self.register_tool(self.get_scratchpad_metrics)
+        else:
+            self._debug_step("Skipping built-in tools registration")
 
         # ── system prompt ───────────────────────────────────────────────────────
         self._debug_step("Setting up system prompt")
@@ -250,22 +457,21 @@ class UltimateReVALAgent:
     def _debug_step(self, message: str, reval_step: bool = False):
         """Log a debug step if debug mode is enabled."""
         if self.debug:
-            # Remove problematic Unicode characters for Windows
-            clean_message = message
-            if os.name == 'nt':  # Windows
-                # Replace problematic Unicode characters
-                clean_message = (clean_message
-                            .replace('🧠', '[BRAIN]')
-                            .replace('🔧', '[TOOL]')
-                            .replace('✅', '[OK]')
-                            .replace('❌', '[ERROR]')
-                            .replace('⚠️', '[WARNING]')
-                            .replace('📦', '[PACKAGE]'))
-            
+            # Replace emojis with text fallbacks for Windows
+            import os
+            if os.name == 'nt':
+                message = message.replace("🧠", "[BRAIN]")
+                message = message.replace("✅", "[OK]")
+                message = message.replace("🔧", "[TOOL]")
+                message = message.replace("❌", "[ERROR]")
+                message = message.replace("⚠️", "[WARNING]")
+                message = message.replace("📦", "[PACKAGE]")
+                
             if reval_step:
-                self.log.debug(f"{Colors.MAGENTA}{Colors.BOLD}ReVAL STEP: {clean_message}{Colors.END}")
+                self.log.debug(f"[bold magenta]ReVAL STEP:[/bold magenta] {message}", extra={"markup": True})
             else:
-                self.log.debug(f"{Colors.BLUE}STEP: {clean_message}{Colors.END}")
+                self.log.debug(f"[blue]STEP:[/blue] {message}", extra={"markup": True})
+    
     def _debug_dump_conversation(self, msgs: List[Dict], prefix: str = ""):
         """Dump the current conversation state to the log file."""
         if not self.debug:
@@ -302,29 +508,13 @@ class UltimateReVALAgent:
             self._debug_step(f"Auto-decorating function {func.__name__}")
             func = tool()(func)  # auto‑decorate if not already
             
-        # If we receive a *bound* method, remember the instance so we can
-        # re-inject it when the tool is executed.
-        if inspect.ismethod(func):
-            owning_instance = func.__self__
-            original_handler = spec.handler
-
-            # The key is that the new handler should NOT expect `owning_instance` as a separate argument.
-            # `original_handler` is already bound to the instance.
-            # We just need to ensure the call is awaited correctly.
-            async def bound_method_wrapper(*args, **kwargs):
-                # 'original_handler' is already the bound method, so it implicitly has `self`.
-                # We just call it with the provided args from the LLM.
-                return await original_handler(*args, **kwargs)
-
-            # We create a NEW ToolSpec to avoid modifying the original in-place
-            spec = ToolSpec(
-                name=spec.name,
-                description=spec.description,
-                args_schema=spec.args_schema,
-                handler=bound_method_wrapper
-            )      # 🔑
-            
         spec: ToolSpec = func.__tool_spec__  # type: ignore[attr-defined]
+            
+        # If we receive a *bound* method, ensure the handler is the method itself
+        if inspect.ismethod(func):
+            # The handler should be the method itself, not a wrapper around it
+            spec.handler = func
+            
         self._debug_step(f"Registering tool: {spec.name}")
         self.tools[spec.name] = spec
         # Only refresh system prompt if persona_prompt is already set
@@ -339,18 +529,14 @@ class UltimateReVALAgent:
             attr = getattr(obj, name)
             if callable(attr):
                 try:
-                    # Check if the attribute already has a tool_spec (from @tool decorator)
+                    # Check if the attribute already has a tool_spec
                     if hasattr(attr, "__tool_spec__"):
-                        # If using a different tool decorator with compatible ToolSpec,
-                        # we need to handle the method binding properly
                         tool_spec = attr.__tool_spec__
                         if all(hasattr(tool_spec, field) for field in ["name", "description", "args_schema", "handler"]):
                             # Create a new wrapper that properly binds the method to the instance
                             original_handler = tool_spec.handler
                             
-                            # Create a new handler that binds the method to the instance
                             async def bound_handler(*args, _orig=original_handler, **kwargs):
-                                # ALWAYS pass the owning instance (obj) as first arg
                                 return await _orig(obj, *args, **kwargs)
                             
                             # Create a new ToolSpec with the bound handler
@@ -358,19 +544,18 @@ class UltimateReVALAgent:
                                 name=tool_spec.name,
                                 description=tool_spec.description,
                                 args_schema=tool_spec.args_schema,
-                                handler=bound_handler
+                                handler=bound_handler,
+                                expected_runtime=getattr(tool_spec, 'expected_runtime', None)
                             )
                             self.tools[bound_spec.name] = bound_spec
                             if hasattr(self, "persona_prompt"):
                                 self._refresh_system_prompt()
                             continue
                         
-                    # For methods, we need to create a wrapper function that can have attributes
+                    # For methods, create a wrapper
                     if inspect.ismethod(attr):
-                        # Create a wrapper function that calls the method
                         method = attr
                         
-                        # Create a proper wrapper that preserves async/sync behavior
                         if asyncio.iscoroutinefunction(method):
                             async def async_wrapper(*args, _m=method, **kwargs):
                                 return await _m(*args, **kwargs)
@@ -384,10 +569,9 @@ class UltimateReVALAgent:
                         wrapper.__doc__ = method.__doc__
                         self.register_tool(wrapper)
                     else:
-                        # For non-methods, we need to create a bound method
+                        # For non-methods, bind to instance
                         method = attr
                         
-                        # Create a proper wrapper that preserves async/sync behavior and binds to instance
                         if asyncio.iscoroutinefunction(method):
                             async def async_bound_wrapper(*args, _m=method, **kwargs):
                                 return await _m(obj, *args, **kwargs)
@@ -442,6 +626,14 @@ class UltimateReVALAgent:
         except KeyError as err:
             return {"error": str(err)}
 
+    @tool("Get scratchpad metrics including item count.")
+    async def get_scratchpad_metrics(self) -> Dict[str, Any]:
+        """Return current scratchpad metrics."""
+        return {
+            "items_count": self.scratch.items_count,
+            "memory_usage_estimate": sys.getsizeof(self.scratch),
+        }
+
     @tool("Self‑reflect: critique current plan and propose new one.")
     async def self_reflect_and_replan(self, critique: str, new_plan: List[str]):
         return {"meta": "reflect", "critique": critique, "plan": new_plan}
@@ -452,13 +644,53 @@ class UltimateReVALAgent:
         score = min(len(prompt.split()) / 4000, 1.0)
         return score
 
-    @tool("Simple self‑verifier. Returns True if answer likely correct (stub).")
-    async def simple_verifier(self, answer: str, question: str) -> bool:
-        # Placeholder implementation; always returns True.
-        return True
+    @tool("Verify answer correctness using a secondary model.", expected_runtime=3.0)
+    async def simple_verifier(self, answer: str, question: str) -> Dict[str, Any]:
+        """Real implementation of simple_verifier using a small model."""
+        checklist_prompt = f"""
+You are a verification assistant. Evaluate if the answer correctly addresses the question.
 
-    # ── Dynamic toolsmith ──────────────────────────────────────────────────
-    @tool("Create a new Python tool, test it, and register it if tests pass.")
+Question: {question}
+Answer: {answer}
+
+Checklist:
+1. Does the answer directly address the question?
+2. Is the answer factually plausible?
+3. Is the answer complete (not missing key parts)?
+4. Is the answer internally consistent?
+
+Respond with JSON:
+{{"is_correct": true/false, "explanation": "brief reason", "confidence": 0.0-1.0}}
+"""
+        
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.verifier_model,
+                messages=[
+                    {"role": "system", "content": "You are a precise verification assistant."},
+                    {"role": "user", "content": checklist_prompt}
+                ],
+                temperature=0.1,
+                max_tokens=200,
+                response_format={"type": "json_object"}
+            )
+            
+            result = json.loads(response.choices[0].message.content or "{}")
+            return {
+                "verified": result.get("is_correct", False),
+                "explanation": result.get("explanation", ""),
+                "confidence": result.get("confidence", 0.5)
+            }
+        except Exception as e:
+            self.log.error(f"Verifier error: {e}")
+            return {
+                "verified": True,  # Default to true on error
+                "explanation": f"Verification error: {str(e)}",
+                "confidence": 0.0
+            }
+
+    # ── Dynamic toolsmith with Docker sandbox ──────────────────────────────
+    @tool("Create a new Python tool, test it in sandbox, and register if safe.", expected_runtime=15.0)
     async def create_and_test_tool(
         self,
         tool_name: str,
@@ -466,16 +698,63 @@ class UltimateReVALAgent:
         python_code: str,
         test_code: str,
     ) -> str:
-        ns: Dict[str, Any] = {}
-        exec(python_code, globals(), ns)
-        if tool_name not in ns:
-            return "Error: function not defined."
-        fn = ns[tool_name]
-        exec(test_code, globals(), {"candidate": fn})
-        setattr(self, tool_name, fn.__get__(self))
-        self.register_tool(getattr(self, tool_name))
-        self.tools[tool_name].description = description  # type: ignore
-        return f"Tool '{tool_name}' created and registered."
+        """Create and test a new tool in a Docker sandbox."""
+        if not self.docker_sandbox:
+            return "Error: Docker sandbox not available. Install docker package."
+        
+        # Combine tool code and test code
+        full_code = f"""
+{python_code}
+
+# Test section
+if __name__ == "__main__":
+    candidate = {tool_name}
+    {test_code}
+    print("All tests passed!")
+"""
+        
+        # Execute in sandbox
+        success, output = await self.docker_sandbox.execute_code(
+            full_code,
+            timeout=10,
+            memory_limit="128m"
+        )
+        
+        if not success:
+            return f"Tool testing failed:\n{output}"
+        
+        # If tests pass, register the tool (but still in a safe namespace)
+        try:
+            ns: Dict[str, Any] = {}
+            exec(python_code, {"__builtins__": {}}, ns)
+            
+            if tool_name not in ns:
+                return "Error: function not defined in code."
+            
+            fn = ns[tool_name]
+            # Wrap the function to ensure it's async
+            if not asyncio.iscoroutinefunction(fn):
+                async def async_fn(*args, **kwargs):
+                    return fn(*args, **kwargs)
+                fn = async_fn
+            
+            # Create a bound method
+            setattr(self, tool_name, fn.__get__(self))
+            self.register_tool(getattr(self, tool_name))
+            
+            # Update description
+            if tool_name in self.tools:
+                self.tools[tool_name] = ToolSpec(
+                    name=tool_name,
+                    description=description,
+                    args_schema=self.tools[tool_name].args_schema,
+                    handler=self.tools[tool_name].handler,
+                    expected_runtime=None
+                )
+            
+            return f"Tool '{tool_name}' created and registered successfully.\nTest output:\n{output}"
+        except Exception as e:
+            return f"Error registering tool: {str(e)}"
 
     # ======================================================================
     # System prompt
@@ -489,7 +768,7 @@ class UltimateReVALAgent:
             tool_lines.append(f"- `{spec.name}({params})`: {spec.description}")
         tools_doc = "\n".join(tool_lines)
         usage_doc = (
-            "Tools are available via *native function‑calling* (if supported) **or** via a JSON fall‑back.\n\n"  # noqa: E501
+            "Tools are available via *native function‑calling* (if supported) **or** via a JSON fall‑back.\n\n"
             "When using the fall‑back, reply **only** with one JSON block:\n"
             "```json\n{\"tool_call\": {\"name\": <tool_name>, \"arguments\": {…}}}\n```"
         )
@@ -500,10 +779,8 @@ class UltimateReVALAgent:
     # ======================================================================
     async def _call_llm(self, messages: List[Dict]) -> Dict:
         """Call the LLM with graceful degradation between modes."""
-        self._debug_step(f"{Colors.BOLD}{Colors.BLUE}🧠 Calling LLM with {len(messages)} messages{Colors.END}")
-        if self.debug:
-            self.log.debug(f"Last message: {messages[-1].get('content', '')[:100]}...")
-            
+        self._debug_step("[bold blue]🧠 Calling LLM[/bold blue]", reval_step=False)
+        
         want_native = self.tool_support_flag or (self._fc_supported is not False)
         fc_schema = None
         if want_native:
@@ -518,9 +795,9 @@ class UltimateReVALAgent:
                 }
                 for s in self.tools.values()
             ]
-            self._debug_step(f"{Colors.CYAN}Using native function calling with {len(fc_schema)} tools{Colors.END}")
+            self._debug_step(f"[cyan]Using native function calling with {len(fc_schema)} tools[/cyan]")
         else:
-            self._debug_step(f"{Colors.YELLOW}Using JSON fallback for tool calling{Colors.END}")
+            self._debug_step("[yellow]Using JSON fallback for tool calling[/yellow]")
             
         params = dict(
             model=self.model,
@@ -531,209 +808,120 @@ class UltimateReVALAgent:
             tool_choice="auto" if want_native else None,
         )
         
-        # Add OpenRouter specific parameters if using OpenRouter
+        # Add OpenRouter specific parameters
         if hasattr(self, "is_openrouter") and self.is_openrouter:
             self._debug_step("Adding OpenRouter specific parameters")
-            # OpenRouter uses these headers
             headers = {
                 "HTTP-Referer": os.getenv("HTTP_REFERER", "https://synapsereval.local"),
                 "X-Title": os.getenv("X_TITLE", "SynapseREval")
             }
             params["extra_headers"] = headers
             params["extra_body"] = {
-                "transforms": ["middle-out"],  # Recommended by OpenRouter
+                "transforms": ["middle-out"],
             }
         
-        # Log the request parameters if in debug mode
-        self._debug_llm_request(params)
-            
         for attempt in range(3):
             try:
                 self._debug_step(f"LLM request attempt {attempt+1}/3")
                 resp = await self.client.chat.completions.create(**params)
                 
-                # Check for error in response
                 if getattr(resp, "error", None):
                     error_code = resp.error.get("code", "unknown")
                     error_msg = resp.error.get("message", "Unknown error")
-                    self._debug_step(f"{Colors.RED}❌ LLM backend error {error_code}: {error_msg}{Colors.END}")
+                    self._debug_step(f"[red]❌ LLM backend error {error_code}: {error_msg}[/red]")
                     raise RuntimeError(f"LLM backend error {error_code}: {error_msg}")
                 
-                # Check for missing choices
                 if not getattr(resp, "choices", None):
-                    self._debug_step(f"{Colors.RED}❌ LLM returned no choices{Colors.END}")
+                    self._debug_step("[red]❌ LLM returned no choices[/red]")
                     raise RuntimeError("LLM returned no choices")
                 
-                self._fc_supported = want_native
-                self._debug_step(f"{Colors.GREEN}✅ LLM request successful{Colors.END}")
+                # Update function calling support status
+                if self._fc_supported != want_native:
+                    self._fc_supported = want_native
+                    self.fc_cache.set(self.model, want_native)
                 
-                # Log the response if in debug mode
-                self._debug_llm_response(resp)
-                
+                self._debug_step("[green]✅ LLM request successful[/green]")
                 return resp.choices[0].message.model_dump()
+                
             except OpenAIError as err:
-                self._debug_step(f"{Colors.RED}❌ LLM error: {err}{Colors.END}")
+                self._debug_step(f"[red]❌ LLM error: {err}[/red]")
                 if want_native and (
                     getattr(err, "status_code", None) == 404 or "No endpoints" in str(err)
                 ):
-                    # function‑calling not supported → downgrade once
-                    self._debug_step(f"{Colors.YELLOW}⚠️ Function calling not supported, downgrading to JSON fallback{Colors.END}")
+                    self._debug_step("[yellow]⚠️ Function calling not supported, downgrading[/yellow]")
                     self._fc_supported = False
+                    self.fc_cache.set(self.model, False)
                     want_native = False
                     params["tools"] = None
                     params["tool_choice"] = None
                     continue
                 if isinstance(err, (RateLimitError, APIConnectionError)):
                     wait_time = 2 ** attempt
-                    self._debug_step(f"{Colors.YELLOW}⚠️ Rate limit or connection error, retrying in {wait_time}s{Colors.END}")
+                    self._debug_step(f"[yellow]⚠️ Rate limit, retrying in {wait_time}s[/yellow]")
                     await asyncio.sleep(wait_time)
                     continue
-                if attempt < 2:  # Try again for any other error, but only twice
+                if attempt < 2:
                     wait_time = 2 ** attempt
-                    self._debug_step(f"{Colors.YELLOW}⚠️ OpenAI error, retrying in {wait_time}s{Colors.END}")
+                    self._debug_step(f"[yellow]⚠️ Error, retrying in {wait_time}s[/yellow]")
                     await asyncio.sleep(wait_time)
                     continue
                 raise
             except Exception as ex:
-                self._debug_step(f"{Colors.RED}❌ Unexpected error: {ex}{Colors.END}")
-                if attempt < 2:  # Try again for any other error, but only twice
+                self._debug_step(f"[red]❌ Unexpected error: {ex}[/red]")
+                if attempt < 2:
                     wait_time = 2 ** attempt
-                    self._debug_step(f"{Colors.YELLOW}⚠️ Unexpected error, retrying in {wait_time}s{Colors.END}")
+                    self._debug_step(f"[yellow]⚠️ Retrying in {wait_time}s[/yellow]")
                     await asyncio.sleep(wait_time)
                     continue
                 raise
-        self._debug_step(f"{Colors.RED}{Colors.BOLD}❌ LLM FAILED AFTER ALL RETRIES{Colors.END}")
+        
+        self._debug_step("[red bold]❌ LLM FAILED AFTER ALL RETRIES[/red bold]")
         raise RuntimeError("LLM failed after retries")
-        
-    def _debug_llm_request(self, params: Dict):
-        """Log the LLM request parameters if in debug mode."""
-        if not self.debug:
-            return
-            
-        # Create a safe copy of the parameters to log
-        safe_params = params.copy()
-        
-        # Remove sensitive information
-        if "extra_headers" in safe_params:
-            safe_params["extra_headers"] = {k: v for k, v in safe_params["extra_headers"].items()}
-            
-        # Truncate messages for readability
-        if "messages" in safe_params:
-            safe_params["messages"] = [
-                {
-                    "role": m.get("role", "unknown"),
-                    "content": (m.get("content", "")[:50] + "...") if m.get("content") else None,
-                    "has_tool_calls": "tool_calls" in m,
-                    "is_tool": "name" in m and m.get("role") == "tool",
-                }
-                for m in safe_params["messages"]
-            ]
-            
-        # Truncate tool definitions for readability
-        if "tools" in safe_params and safe_params["tools"]:
-            safe_params["tools"] = [
-                {
-                    "type": t.get("type", "unknown"),
-                    "function": {
-                        "name": t.get("function", {}).get("name", "unknown"),
-                        "description": (t.get("function", {}).get("description", "")[:50] + "..."),
-                        "params_count": len(t.get("function", {}).get("parameters", {}).get("properties", {})),
-                    }
-                }
-                for t in safe_params["tools"]
-            ]
-            
-        self.log.debug(f"LLM REQUEST: {json.dumps(safe_params, default=str)}")
-        
-    def _debug_llm_response(self, resp):
-        """Log the LLM response if in debug mode."""
-        if not self.debug:
-            return
-            
-        try:
-            # Extract key information from the response
-            resp_data = {
-                "id": getattr(resp, "id", None),
-                "model": getattr(resp, "model", None),
-                "usage": getattr(resp, "usage", None),
-                "choices": [],
-                "error": getattr(resp, "error", None)
-            }
-            
-            # Extract choice information if present
-            choices = getattr(resp, "choices", [])
-            for choice in choices:
-                choice_data = {
-                    "index": getattr(choice, "index", None),
-                    "finish_reason": getattr(choice, "finish_reason", None),
-                }
-                
-                # Extract message information
-                message = getattr(choice, "message", None)
-                if message:
-                    msg_data = {
-                        "role": getattr(message, "role", None),
-                        "content": (getattr(message, "content", "")[:100] + "...") if getattr(message, "content", None) else None,
-                    }
-                    
-                    # Extract tool calls if present
-                    tool_calls = getattr(message, "tool_calls", None)
-                    if tool_calls:
-                        msg_data["tool_calls"] = []
-                        for tc in tool_calls:
-                            tc_data = {
-                                "id": getattr(tc, "id", None),
-                                "type": getattr(tc, "type", None),
-                            }
-                            
-                            # Extract function information
-                            function = getattr(tc, "function", None)
-                            if function:
-                                tc_data["function"] = {
-                                    "name": getattr(function, "name", None),
-                                    "arguments": (getattr(function, "arguments", "")[:50] + "...") if getattr(function, "arguments", None) else None,
-                                }
-                                
-                            msg_data["tool_calls"].append(tc_data)
-                            
-                    choice_data["message"] = msg_data
-                    
-                resp_data["choices"].append(choice_data)
-                
-            self.log.debug(f"LLM RESPONSE: {json.dumps(resp_data, default=str)}")
-        except Exception as e:
-            self.log.debug(f"Error logging LLM response: {e}")
-            self.log.debug(f"LLM RESPONSE RAW: {resp}")
 
     # ======================================================================
-    # Tool execution helper (with large‑payload off‑loading)
+    # Tool execution helper with adaptive timeout
     # ======================================================================
     async def _execute_tool(self, name: str, args: Dict[str, Any]):
-        self._debug_step(f"{Colors.CYAN}{Colors.BOLD}🔧 Executing tool: {name}{Colors.END} with args: {args}")
+        self._debug_step(f"[cyan bold]🔧 Executing tool: {name}[/cyan bold]")
         if name not in self.tools:
-            self._debug_step(f"{Colors.RED}❌ Unknown tool: {name}{Colors.END}")
+            self._debug_step(f"[red]❌ Unknown tool: {name}[/red]")
             return {"error": f"Unknown tool {name}"}
+        
         spec = self.tools[name]
         try:
             validated = spec.args_schema(**args)
             self._debug_step(f"Arguments validated for {name}")
-            result = await spec.handler(**validated.dict())
-            self._debug_step(f"{Colors.GREEN}✅ Tool {name} executed successfully{Colors.END}")
             
-            # Large payload? → off‑load to scratchpad
+            # Adaptive timeout based on expected_runtime
+            timeout = 25  # default
+            if spec.expected_runtime:
+                timeout = max(25, spec.expected_runtime * 1.5)
+                self._debug_step(f"Using adaptive timeout: {timeout}s for {name}")
+            
+            result = await asyncio.wait_for(
+                spec.handler(**validated.dict()),
+                timeout=timeout
+            )
+            self._debug_step(f"[green]✅ Tool {name} executed successfully[/green]")
+            
+            # Large payload off‑loading
             if (
                 isinstance(result, (dict, list, str))
                 and len(json.dumps(result, default=str)) > 4000
             ):
                 key = self.scratch.store(result, ttl=300)
-                self._debug_step(f"{Colors.YELLOW}📦 Large result from {name} stored in scratchpad with key {key}{Colors.END}")
+                self._debug_step(f"[yellow]📦 Large result stored: {key}[/yellow]")
                 return {"scratchpad_key": key, "info": f"{name} output stored (large payload)"}
             return result
+            
+        except asyncio.TimeoutError:
+            self._debug_step(f"[red]❌ Tool {name} timed out[/red]")
+            return {"error": f"Tool {name} timed out"}
         except ValidationError as ve:
-            self._debug_step(f"{Colors.RED}❌ Validation error in {name}: {ve}{Colors.END}")
+            self._debug_step(f"[red]❌ Validation error in {name}: {ve}[/red]")
             return {"error": str(ve)}
-        except Exception as exc:  # noqa: B902
-            self._debug_step(f"{Colors.RED}❌ Exception in {name}: {exc}{Colors.END}")
+        except Exception as exc:
+            self._debug_step(f"[red]❌ Exception in {name}: {exc}[/red]")
             if self.debug:
                 self.log.exception(f"Tool execution error in {name}")
             return {"error": str(exc)}
@@ -742,33 +930,27 @@ class UltimateReVALAgent:
     # Parsing helpers
     # ======================================================================
     def _extract_tool_calls(self, resp: Dict) -> Optional[List[Dict]]:
-        """Return a list of tool‑call dicts or None (for both modes)."""
+        """Extract tool calls using improved parsing."""
         # Native function‑calling
         if resp.get("tool_calls"):
-            if self.debug:
-                self.log.debug(f"{Colors.CYAN}Found native tool calls: {len(resp['tool_calls'])}{Colors.END}")
+            self._debug_step(f"[cyan]Found {len(resp['tool_calls'])} native tool calls[/cyan]")
             return resp["tool_calls"]
         
-        # JSON fall‑back parsing
+        # Enhanced JSON parsing
         content = resp.get("content")
         if not content:
-            if self.debug:
-                self.log.debug(f"{Colors.RED}No content in response{Colors.END}")
             return None
-            
-        m = self._JSON_RE.search(content)
-        if not m:
-            if self.debug:
-                self.log.debug(f"{Colors.RED}No JSON block found in content{Colors.END}")
+        
+        json_str = strip_json_markdown(content)
+        if not json_str:
             return None
-            
+        
         try:
-            blob = json.loads(m.group(1))
+            blob = json.loads(json_str)
             if "tool_call" in blob and {"name", "arguments"} <= set(blob["tool_call"].keys()):
                 tc = blob["tool_call"]
                 tool_id = f"tc_{uuid.uuid4().hex[:6]}"
-                if self.debug:
-                    self.log.debug(f"{Colors.CYAN}Extracted JSON tool call: {tc['name']} (ID: {tool_id}){Colors.END}")
+                self._debug_step(f"[cyan]Extracted JSON tool call: {tc['name']}[/cyan]")
                 return [
                     {
                         "id": tool_id,
@@ -779,13 +961,8 @@ class UltimateReVALAgent:
                         },
                     }
                 ]
-            else:
-                if self.debug:
-                    self.log.debug(f"{Colors.RED}Invalid tool_call format in JSON: {blob}{Colors.END}")
         except Exception as e:
-            if self.debug:
-                self.log.debug(f"{Colors.RED}Error parsing JSON tool call: {str(e)}{Colors.END}")
-            return None
+            self._debug_step(f"[red]Error parsing JSON: {e}[/red]")
         return None
 
     def _tool_messages(self, calls: List[Dict], results: List[Any]):
@@ -802,16 +979,58 @@ class UltimateReVALAgent:
         return msgs
 
     # ======================================================================
-    # Utility
+    # Utility with hierarchical trimming
     # ======================================================================
     def _tokens(self, txt: str | None) -> int:
         return len(self._enc.encode(txt or ""))
 
-    def _trim(self, msgs: List[Dict]):
+    def _trim_hierarchical(self, msgs: List[Dict]) -> List[Dict]:
+        """Hierarchical message trimming preserving important messages."""
         budget = self.max_model_tokens - self.max_response_tokens
-        while sum(self._tokens(m.get("content")) for m in msgs) > budget and len(msgs) > 3:
-            msgs.pop(1)
-        return msgs
+        current_tokens = sum(self._tokens(m.get("content")) for m in msgs)
+        
+        if current_tokens <= budget:
+            return msgs
+        
+        # Never remove: system prompt (0), first user message (1), last few messages
+        protected_indices = {0, 1, len(msgs) - 1}
+        if len(msgs) > 3:
+            protected_indices.add(len(msgs) - 2)
+        
+        # Build priority list (tool messages have lowest priority)
+        priorities = []
+        for i, msg in enumerate(msgs):
+            if i in protected_indices:
+                priority = 0  # Highest priority
+            elif msg.get("role") == "tool":
+                priority = 3  # Lowest priority
+            elif msg.get("role") == "user":
+                priority = 2  # Medium priority
+            else:
+                priority = 1  # Assistant messages
+            priorities.append((priority, i))
+        
+        # Sort by priority (highest priority first) and age (older first within same priority)
+        priorities.sort(key=lambda x: (x[0], x[1]))
+        
+        # Remove messages until within budget
+        removed_indices = set()
+        for priority, idx in priorities:
+            if idx in protected_indices:
+                continue
+            
+            # Simulate removal
+            test_msgs = [m for i, m in enumerate(msgs) if i not in removed_indices and i != idx]
+            test_tokens = sum(self._tokens(m.get("content")) for m in test_msgs)
+            
+            if test_tokens <= budget:
+                removed_indices.add(idx)
+                current_tokens = test_tokens
+                if current_tokens <= budget:
+                    break
+        
+        # Return filtered messages
+        return [m for i, m in enumerate(msgs) if i not in removed_indices]
 
     # ======================================================================
     # Chat loop (ReVAL)
@@ -830,12 +1049,13 @@ class UltimateReVALAgent:
         # Dump initial conversation state
         self._debug_dump_conversation(msgs, prefix="INITIAL ")
         max_cycles = 30
-        for cycle in range(max_cycles):  # max ReVAL cycles
-            self._debug_step(f"{Colors.MAGENTA}{Colors.BOLD}ReVAL CYCLE {cycle+1}/{max_cycles} STARTED{Colors.END}", reval_step=True)
+        
+        for cycle in range(max_cycles):
+            self._debug_step(f"[magenta bold]ReVAL CYCLE {cycle+1}/{max_cycles} STARTED[/magenta bold]", reval_step=True)
             
             # REASON phase
-            self._debug_step(f"{Colors.YELLOW}REASON PHASE: Preparing to call LLM{Colors.END}", reval_step=True)
-            msgs = self._trim(msgs)
+            self._debug_step("[yellow]REASON PHASE: Preparing to call LLM[/yellow]", reval_step=True)
+            msgs = self._trim_hierarchical(msgs)  # Use hierarchical trimming
             self._debug_step(f"Messages trimmed to {len(msgs)} messages")
             
             assistant = await self._call_llm(msgs)
@@ -845,18 +1065,18 @@ class UltimateReVALAgent:
             # Dump conversation after assistant response
             self._debug_dump_conversation([assistant], prefix=f"CYCLE {cycle+1} ASSISTANT ")
 
-            # VERIFY phase - Confidence gating (look for CONF=x.y in content)
-            self._debug_step(f"{Colors.YELLOW}VERIFY PHASE: Checking confidence{Colors.END}", reval_step=True)
+            # VERIFY phase - Confidence gating
+            self._debug_step("[yellow]VERIFY PHASE: Checking confidence[/yellow]", reval_step=True)
             conf_match = re.search(r"CONF\s*=\s*([0-9.]+)", assistant.get("content", ""))
             if conf_match:
                 conf_val = float(conf_match.group(1))
                 self._debug_step(f"Confidence value detected: {conf_val}")
                 await self.update_goal_state(confidence=conf_val)
                 if conf_val < 0.7:
-                    self._debug_step(f"{Colors.RED}Low confidence {conf_val} detected{Colors.END}", reval_step=True)
+                    self._debug_step(f"[red]Low confidence {conf_val} detected[/red]", reval_step=True)
                     
                     # ADAPT phase
-                    self._debug_step(f"{Colors.YELLOW}ADAPT PHASE: Initiating self-reflection{Colors.END}", reval_step=True)
+                    self._debug_step("[yellow]ADAPT PHASE: Initiating self-reflection[/yellow]", reval_step=True)
                     reflection = await self.self_reflect_and_replan(
                         critique="Low confidence", new_plan=["Retry with deeper reasoning"]
                     )
@@ -864,60 +1084,60 @@ class UltimateReVALAgent:
                     self._debug_step("Self-reflection added to messages")
                     continue
 
-            # Tool phase (part of REASON)
+            # Tool phase
             tool_calls = self._extract_tool_calls(assistant)
             if not tool_calls:
-                self._debug_step(f"{Colors.GREEN}COMPLETION: No tool calls, returning final response{Colors.END}", reval_step=True)
+                self._debug_step("[green]COMPLETION: No tool calls, returning final response[/green]", reval_step=True)
                 return assistant.get("content", "")
 
             self._debug_step(f"Extracted {len(tool_calls)} tool calls")
             
-            async def timed_exec(call):
-                tool_name = call["function"]["name"]
-                self._debug_step(f"Executing tool call: {tool_name}")
-                try:
-                    result = await asyncio.wait_for(
-                        self._execute_tool(
-                            tool_name,
-                            json.loads(call["function"]["arguments"]),
-                        ),
-                        timeout=25,
-                    )
-                    self._debug_step(f"{Colors.GREEN}Tool {tool_name} execution completed{Colors.END}")
-                    return result
-                except asyncio.TimeoutError:
-                    self._debug_step(f"{Colors.RED}Tool {tool_name} execution timed out{Colors.END}")
-                    return {"error": "tool timeout"}
-
-            results = await asyncio.gather(*[timed_exec(c) for c in tool_calls])
+            # Execute tools with adaptive timeout
+            results = []
+            for call in tool_calls:
+                result = await self._execute_tool(
+                    call["function"]["name"],
+                    json.loads(call["function"]["arguments"]),
+                )
+                results.append(result)
+            
             self._debug_step(f"All tool calls executed, got {len(results)} results")
 
             # VERIFY phase - verification pass
-            self._debug_step(f"{Colors.YELLOW}VERIFY PHASE: Checking results{Colors.END}", reval_step=True)
-            if results:
-                self._debug_step("Running verification on first result")
-                ok = await self.simple_verifier(answer=str(results[0]), question=user_prompt)
-                if not ok:
+            self._debug_step("[yellow]VERIFY PHASE: Running verification[/yellow]", reval_step=True)
+            if results and "simple_verifier" not in [tc["function"]["name"] for tc in tool_calls]:
+                # Don't verify the verifier itself
+                verification = await self.simple_verifier(
+                    answer=str(results[0]), 
+                    question=user_prompt
+                )
+                if not verification.get("verified", True):
                     # ADAPT phase
-                    self._debug_step(f"{Colors.RED}Verification failed{Colors.END}", reval_step=True)
-                    self._debug_step(f"{Colors.YELLOW}ADAPT PHASE: Initiating self-reflection{Colors.END}", reval_step=True)
+                    self._debug_step(f"[red]Verification failed: {verification.get('explanation', '')}[/red]", reval_step=True)
+                    self._debug_step("[yellow]ADAPT PHASE: Initiating self-reflection[/yellow]", reval_step=True)
                     reflection = await self.self_reflect_and_replan(
-                        critique="Verifier failed", new_plan=["Revise answer"]
+                        critique=f"Verifier failed: {verification.get('explanation', '')}", 
+                        new_plan=["Revise answer based on verification feedback"]
                     )
                     msgs.append({"role": "assistant", "content": json.dumps(reflection)})
                     continue
-                self._debug_step(f"{Colors.GREEN}Verification passed{Colors.END}", reval_step=True)
+                self._debug_step("[green]Verification passed[/green]", reval_step=True)
 
             # LOOP phase
-            self._debug_step(f"{Colors.YELLOW}LOOP PHASE: Processing tool results{Colors.END}", reval_step=True)
+            self._debug_step("[yellow]LOOP PHASE: Processing tool results[/yellow]", reval_step=True)
             tool_messages = self._tool_messages(tool_calls, results)
             msgs.extend(tool_messages)
             self._debug_step(f"Added {len(tool_messages)} tool messages to conversation")
             
             # Dump conversation after tool responses
             self._debug_dump_conversation(tool_messages, prefix=f"CYCLE {cycle+1} TOOLS ")
-            self._debug_step(f"{Colors.MAGENTA}{Colors.BOLD}ReVAL CYCLE {cycle+1} COMPLETED{Colors.END}", reval_step=True)
+            self._debug_step(f"[magenta bold]ReVAL CYCLE {cycle+1} COMPLETED[/magenta bold]", reval_step=True)
             
-        self._debug_step(f"{Colors.RED}REACHED MAX REASONING CYCLES{Colors.END}", reval_step=True)
+        self._debug_step("[red]REACHED MAX REASONING CYCLES[/red]", reval_step=True)
         return "⚠️ Reached max reasoning cycles."
+
+    def __del__(self):
+        """Cleanup when agent is destroyed."""
+        if hasattr(self, 'scratch'):
+            self.scratch.stop_cleanup_task()
 

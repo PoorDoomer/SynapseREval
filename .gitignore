@@ -7,3 +7,8 @@ __pycache__/
 .env.local
 .env
 brains/
+core/databasevf.db
+core/databasevf_schema.json
+dashboard.html
+electrical_consumption_dashboard.html
+.fc_cache.json

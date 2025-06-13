@@ -6,10 +6,13 @@ import sys
 import time
 from pathlib import Path
 
+# Set Python's output encoding to UTF-8 for Windows compatibility with emojis
+os.environ["PYTHONIOENCODING"] = "utf-8"
+
 # Add the parent directory to the path for imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from core.llm import UltimateReVALAgent
+from core.llm import UltimateReVALAgent, tool
 from core.synapses import SynapseNetwork, Neuron
 from dotenv import load_dotenv
 
@@ -44,7 +47,14 @@ def print_weights(net: SynapseNetwork):
     print(f"{C.BLUE}Current Synapse Weights:{C.END}")
     for u, v, data in net.G.edges(data=True):
         weight = data['syn'].weight
-        color = C.GREEN if weight > 1.0 else C.YELLOW if weight < 1.0 else C.BLUE
+        if weight < 0:
+            color = C.RED  # Red for inhibitory connections
+        elif weight > 1.0:
+            color = C.GREEN
+        elif weight < 1.0:
+            color = C.YELLOW
+        else:
+            color = C.BLUE
         print(f"  {u} -> {v}: {color}{weight:.4f}{C.END}")
     print("-" * 20)
 
@@ -54,6 +64,7 @@ async def main():
     1.  Adaptive Routing via Softmax.
     2.  Synaptic Learning via STDP.
     3.  Autonomous Tool Generation by an agent.
+    4.  Lateral Inhibition for competitive dynamics.
     """
     # Create logs directory if it doesn't exist
     logs_dir = os.path.join(os.path.dirname(__file__), '..', 'logs')
@@ -87,17 +98,21 @@ async def main():
     print_info("A router agent must decide which specialist can answer a math question.")
     print_info("One specialist is a 'Philosopher' (bad choice), the other is a 'Coder' (good choice).")
     print_info("Initially, the Coder doesn't know how to calculate square roots and must build a tool for it.")
+    print_info("Specialists use lateral inhibition to compete for processing the task.")
     
     # --- NETWORK INITIALIZATION ---
     net = SynapseNetwork(learning_rate=0.1) # Higher learning rate to see changes faster
 
+    # Initial prompts
+    initial_prompt = "What is the square root of 256?"
+
     # Create persona prompts
     router_prompt = (
-        "You are a Router. Your SOLE function is to choose the best specialist for a task. "
-        "You MUST NOT answer the user's question yourself. "
-        "First, think step-by-step about the user's request. "
-        "Second, in ONE sentence, state which specialist ('Coder' or 'Philosopher') you choose and why. "
-        "Your output MUST be ONLY that one sentence."
+        "You are a Router. Your job is to analyze the user's request and determine which specialist would be best suited to handle it. "
+        "For mathematical calculations, especially involving square roots, the 'Coder' would be the best choice. "
+        "For philosophical discussions about abstract concepts, the 'Philosopher' would be the best choice. "
+        "Analyze the request carefully, then output a brief assessment of which specialist would be best and why. "
+        "Be concise but clear in your reasoning."
     )
     
     philosopher_prompt = (
@@ -121,28 +136,42 @@ async def main():
         "Your output should be a single sentence, like: 'The final answer is X.'"
     )
 
-    # Add neurons
-    net.add_neuron("Router", Neuron(agent_factory("Router", "router", router_prompt), threshold=1.0))
-    net.add_neuron("Philosopher", Neuron(agent_factory("Philosopher", "philosopher", philosopher_prompt), threshold=1.0))
-    net.add_neuron("Coder", Neuron(agent_factory("Coder", "coder", coder_prompt), threshold=1.0))
-    net.add_neuron("Finalizer", Neuron(agent_factory("Finalizer", "finalizer", finalizer_prompt), threshold=1.0))
+    # Create agents
+    router_agent = agent_factory("Router", "router", router_prompt)
+    philosopher_agent = agent_factory("Philosopher", "philosopher", philosopher_prompt)
+    coder_agent = agent_factory("Coder", "coder", coder_prompt)
+    finalizer_agent = agent_factory("Finalizer", "finalizer", finalizer_prompt)
 
-    # Connect neurons
+    # Add neurons
+    net.add_neuron("Router", Neuron(router_agent, threshold=1.0))
+    net.add_neuron("Philosopher", Neuron(philosopher_agent, threshold=0.8))  # Lower threshold to ensure it can fire
+    net.add_neuron("Coder", Neuron(coder_agent, threshold=0.8))  # Lower threshold to ensure it can fire
+    net.add_neuron("Finalizer", Neuron(finalizer_agent, threshold=1.0))
+
+    # Connect neurons with the new brain-like architecture
     print_header("INITIAL NETWORK TOPOLOGY")
-    net.connect("Router", "Philosopher", weight=1.0) # Initially, equal weights
-    net.connect("Router", "Coder", weight=1.0)
-    net.connect("Philosopher", "Finalizer", weight=0.5) # Weak connection, as it's a bad path
-    net.connect("Coder", "Finalizer", weight=1.5)       # Strong connection, this is the good path
+    
+    # Router connects to both specialists with different weights
+    # For math questions, Router->Coder should have higher weight
+    net.connect("Router", "Coder", weight=2.0)  # Strong connection for math questions
+    net.connect("Router", "Philosopher", weight=0.9)  # Weaker connection for math questions
+    
+    # Lateral inhibition between specialists (competitive dynamics)
+    net.connect("Coder", "Philosopher", weight=-2.0)  # Coder strongly inhibits Philosopher
+    net.connect("Philosopher", "Coder", weight=-2.0)  # Philosopher strongly inhibits Coder
+    
+    # Output connections to Finalizer
+    net.connect("Philosopher", "Finalizer", weight=0.5)  # Weak connection, as it's a bad path
+    net.connect("Coder", "Finalizer", weight=1.5)  # Strong connection, this is the good path
     
     print_weights(net)
 
     # --- RUN 1: The First Attempt ---
     print_header("RUN 1: Asking the network to calculate sqrt(256)")
-    initial_prompt = "What is the square root of 256?"
     
     # We will run the network multiple times to see it learn
     history = await net.run(
-        max_cycles=8,
+        max_cycles=10,
         entry_neuron="Router",
         initial_prompt=initial_prompt,
         neuron_delay=1.0
@@ -163,7 +192,6 @@ async def main():
     # Show the learned weights
     print_header("NETWORK STATE AFTER RUN 1 (STDP Learning)")
     print_info("Because Coder -> Finalizer was a successful path, its weight should increase.")
-    print_info("The Router -> Coder connection should also be strengthened.")
     print_weights(net)
     
     # Extract final answer
@@ -185,7 +213,7 @@ async def main():
     second_prompt = "Quickly, what's the square root of 144?"
     
     history_2 = await net.run(
-        max_cycles=5,
+        max_cycles=8,
         entry_neuron="Router",
         initial_prompt=second_prompt,
         neuron_delay=1.0

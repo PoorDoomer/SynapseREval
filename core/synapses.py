@@ -10,6 +10,8 @@ neuron and the message pathways as weighted synapses. This version introduces:
 ✨ ATTENTIONAL ROUTING    – softmax attention over outgoing synapses
 ✨ PERSISTENCE            – JSON (de)serialisation for long‑lived brains
 ✨ META‑SUPERVISOR        – a special neuron that rewires topology at runtime
+✨ INHIBITORY SYNAPSES    – competitive dynamics with negative weights
+✨ LATERAL INHIBITION     – winner-take-all competition between neurons
 
 Dependencies:  networkx, asyncio, numpy (for softmax) – all standard PyPI.
 """
@@ -42,7 +44,7 @@ log = logging.getLogger("SynapseNetwork")
 
 NOW = lambda: time.time()  # simple wall‑clock helper
 TAU = 0.2                  # STDP time constant (seconds)
-MIN_W, MAX_W = 0.05, 5.0   # synaptic weight bounds
+MIN_W, MAX_W = -5.0, 5.0   # synaptic weight bounds - allow negative for inhibition
 
 
 def softmax(vec: List[float]) -> List[float]:
@@ -62,8 +64,8 @@ class Spike:
     """Spike carrying payload + meta."""
 
     payload: Any  # can be str for text, bytes for image/audio, etc.
-    modality: str = "text"  # text | image | audio | sensor
-    weight: float = 1.0
+    modality: str = "text"  # text | image | audio | sensor | signal
+    activation: float = 1.0  # Raw strength of the spike, independent of synapse
     timestamp: float = field(default_factory=NOW)
 
 
@@ -73,7 +75,7 @@ class Synapse:
 
     src: str
     dst: str
-    weight: float = 1.0
+    weight: float = 1.0  # Can be negative for inhibitory connections
     plastic: bool = True
     last_pre_spike: float = field(default_factory=NOW)
     last_post_spike: float = field(default_factory=NOW)
@@ -127,42 +129,57 @@ class Neuron:
 
     # ------------------------------------------------------------------- Spikes
     async def maybe_fire(self, net_history: List[Dict[str, Any]]) -> Optional[Spike]:
-        """If accumulated weight exceeds threshold → fire LLM."""
-        total = sum(sp.weight for sp in self.inbox)
-        if total < self.threshold:
+        """If accumulated activation exceeds threshold → fire LLM or signal."""
+        # Calculate total activation from all incoming spikes
+        total_activation = sum(sp.activation for sp in self.inbox)
+        
+        # Only fire if net activation is above threshold
+        if total_activation < self.threshold:
+            self.inbox.clear()  # Clear inbox even if not firing to prevent accumulation
             return None
 
-        # Aggregate textual prompts only for now; skip other modalities in prompt.
-        prompt_parts = [str(sp.payload) for sp in self.inbox if sp.modality == "text"]
-        self.inbox.clear()
+        # Aggregate textual prompts for the LLM from positive activation spikes
+        prompt_parts = [
+            str(sp.payload) for sp in self.inbox 
+            if sp.modality == "text" and sp.activation > 0
+        ]
+        
+        self.inbox.clear()  # Clear inbox after processing all spikes
 
-        try:
-            # Add a small delay before each LLM call to prevent rate limiting
-            await asyncio.sleep(1.0)
-            
-            # Translate the network's history format to the agent's expected format.
-            # The network history contains outputs from previous agents (neurons).
-            # We map the 'payload' of these outputs to the 'assistant' role's 'content'.
-            formatted_history = [
-                {
-                    "role": "assistant", 
-                    "content": entry.get("payload", "")
-                }
-                for entry in net_history
-            ]
-            
-            # Call the agent with the correctly formatted history
-            response: str = await self.agent.chat(
-                "\n".join(prompt_parts),
-                history=formatted_history
-            )
-        except Exception as ex:  # noqa: BLE001
-            log.error("LLM error in %s: %s", self.role, ex)
-            return None
-
-        self.memory.add(response)
+        response_payload: str
+        if prompt_parts:
+            # We have text prompts, so call the LLM
+            try:
+                # Add a small delay before each LLM call to prevent rate limiting
+                await asyncio.sleep(1.0)
+                
+                # Translate the network's history format to the agent's expected format.
+                formatted_history = [
+                    {"role": "assistant", "content": entry.get("payload", "")}
+                    for entry in net_history
+                ]
+                
+                response_payload = await self.agent.chat(
+                    "\n".join(prompt_parts),
+                    history=formatted_history
+                )
+            except Exception as ex:  # noqa: BLE001
+                log.error("LLM error in %s: %s", self.role, ex)
+                return None
+        else:
+            # No text prompts, but fired due to signals. Fire a "signal" spike.
+            response_payload = f"Signal processed with activation {total_activation:.2f}"
+        
+        self.memory.add(response_payload)
         self.last_fire = NOW()
-        return Spike(payload=response, modality="text", weight=1.0, timestamp=self.last_fire)
+        
+        # Create an outgoing spike with the activation level that triggered this firing
+        return Spike(
+            payload=response_payload, 
+            modality="text",  # Keep as text for logging consistency
+            activation=total_activation, 
+            timestamp=self.last_fire
+        )
 
 
 ###############################################################################
@@ -201,7 +218,8 @@ class SynapseNetwork:
 
     def connect(self, src: str, dst: str, *, weight: float = 1.0, plastic: bool = True):
         self.G.add_edge(src, dst, syn=Synapse(src, dst, weight, plastic))
-        log.info("Synapse created: %s → %s  w=%.2f", src, dst, weight)
+        conn_type = "Inhibitory" if weight < 0 else "Excitatory"
+        log.info("%s Synapse created: %s → %s  w=%.2f", conn_type, src, dst, weight)
 
     # ------------------------------------------------------------- Persistence
     def save(self, path: str | Path):
@@ -250,7 +268,7 @@ class SynapseNetwork:
 
     # ---------------------------------------------------------------- Utilities
     def inject(self, dst: str, payload: Any, *, modality: str = "text", weight: float = 1.0):
-        sp = Spike(payload=payload, modality=modality, weight=weight)
+        sp = Spike(payload=payload, modality=modality, activation=weight)
         self.neurons[dst].inbox.append(sp)
         log.debug("Injected spike into %s (%.2f)", dst, weight)
 
@@ -296,9 +314,10 @@ class SynapseNetwork:
                     continue
                 fired[node] = sp_out
                 log.info(
-                    "⚡ %s fired → %.30s",
+                    "⚡ %s fired → %.30s (activation: %.2f)",
                     node,
                     str(sp_out.payload).replace("\n", " "),
+                    sp_out.activation
                 )
                 # Add delay between neuron processing to avoid rate limiting
                 await asyncio.sleep(neuron_delay)
@@ -316,22 +335,67 @@ class SynapseNetwork:
                             fired[pre].timestamp, post_sp.timestamp, self.lr
                         )
 
-            # ─────────────────────── propagate with soft-attention routing
+            # ─────────────────────── propagate with enhanced routing
             for src, sp in fired.items():
                 outs = list(self.G.out_edges(src, data=True))
                 if not outs:
                     continue
-                weights = [d["syn"].weight for *_ , d in outs]
-                probs = softmax(weights)
-                for (_u, v, d), p in zip(outs, probs):
-                    if np.random.rand() < p:           # stochastic routing
-                        w_eff = d["syn"].weight * sp.weight
-                        self.neurons[v].inbox.append(
-                            Spike(sp.payload, sp.modality, w_eff)
+                
+                # Separate excitatory and inhibitory synapses
+                excitatory_outs = [(u, v, d) for u, v, d in outs if d["syn"].weight > 0]
+                inhibitory_outs = [(u, v, d) for u, v, d in outs if d["syn"].weight < 0]
+                
+                # 1. Send inhibitory signals to ALL connected inhibitory targets
+                for _u, v, d in inhibitory_outs:
+                    # An inhibitory spike carries NEGATIVE activation
+                    inhibitory_spike = Spike(
+                        payload="inhibit", 
+                        modality="signal",
+                        activation=sp.activation * d["syn"].weight  # e.g., 1.5 * -1.0 = -1.5
+                    )
+                    self.neurons[v].inbox.append(inhibitory_spike)
+                    log.debug(
+                        "Inhibitory signal sent %s → %s (%.2f)", 
+                        src, v, inhibitory_spike.activation
+                    )
+                
+                # 2. Use softmax to choose excitatory paths
+                if excitatory_outs:
+                    # If there's only one path, no need for softmax, it always gets chosen
+                    if len(excitatory_outs) == 1:
+                        _u, v, d = excitatory_outs[0]
+                        effective_activation = sp.activation * d["syn"].weight
+                        effective_spike = Spike(
+                            payload=sp.payload, 
+                            modality=sp.modality, 
+                            activation=effective_activation,
+                            timestamp=sp.timestamp
                         )
+                        self.neurons[v].inbox.append(effective_spike)
                         log.debug(
-                            "Spike routed %s → %s  p=%.2f w=%.2f", src, v, p, w_eff
+                            "Excitatory spike routed (single path) %s → %s (activation=%.2f)", 
+                            src, v, effective_activation
                         )
+                    else:
+                        # Stochastic routing for multiple paths
+                        weights = [d["syn"].weight for *_, d in excitatory_outs]
+                        probs = softmax(weights)
+                        
+                        for (_u, v, d), p in zip(excitatory_outs, probs):
+                            if np.random.rand() < p:
+                                # The effective activation is based on source spike and synapse weight
+                                effective_activation = sp.activation * d["syn"].weight
+                                effective_spike = Spike(
+                                    payload=sp.payload, 
+                                    modality=sp.modality, 
+                                    activation=effective_activation,
+                                    timestamp=sp.timestamp
+                                )
+                                self.neurons[v].inbox.append(effective_spike)
+                                log.debug(
+                                    "Excitatory spike routed (stochastic) %s → %s (p=%.2f, activation=%.2f)", 
+                                    src, v, p, effective_activation
+                                )
 
             # ─────────────────────── append to global transcript
             for n, sp in fired.items():
@@ -341,6 +405,7 @@ class SynapseNetwork:
                         "neuron": n,
                         "payload": sp.payload,
                         "modality": sp.modality,
+                        "activation": sp.activation,
                         "timestamp": sp.timestamp,
                     }
                 )
