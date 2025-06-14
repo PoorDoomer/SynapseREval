@@ -106,7 +106,7 @@ The intelligent, resilient "neuron" that performs the actual work.
 2.  Add your API key to this file:
     ```env
     # .env.local
-    OPENROUTER_API_KEY="sk-or-your-key-here"
+    OPENROUTER_API_KEY="sk-or-your-key-here" (or use an even better LLM gateway the best in the world llmgateway.io ) 
     ```
 3.  If you are using OpenRouter, you can also add the following for proper request headers:
     ```env
